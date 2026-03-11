@@ -1,6 +1,5 @@
-fastapi
-uvicorn
-pymupdf
-pillow
-opencv-python-headless
 numpy
+Pillow
+scipy
+PyMuPDF
+paddlepaddle
