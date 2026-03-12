@@ -4,7 +4,6 @@ import argparse
 import json
 import sys
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,109 +21,95 @@ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-@dataclass
-class Prediction:
-    angle: int
-    confidence: float
+def load_inference_module():
+    try:
+        from paddle import inference
+    except ImportError as exc:
+        raise SystemExit(
+            "paddlepaddle is not installed in the active Python environment. "
+            "Install PaddlePaddle before running this script."
+        ) from exc
+    return inference
 
 
-class OfflineOrientationClassifier:
-    def __init__(self, model_dir: Path, use_gpu: bool = False) -> None:
-        try:
-            from paddle import inference
-        except ImportError as exc:
-            raise SystemExit(
-                "paddlepaddle is not installed in the active Python environment. "
-                "Install PaddlePaddle before running this script."
-            ) from exc
+def build_predictor_config(inference, model_file: Path, params_file: Path, use_gpu: bool, safe_mode: bool):
+    config = inference.Config(str(model_file), str(params_file))
+    if use_gpu:
+        config.enable_use_gpu(1000, 0)
+    else:
+        config.disable_gpu()
 
-        model_file = model_dir / "inference.json"
-        params_file = model_dir / "inference.pdiparams"
+    config.switch_ir_optim(not safe_mode)
+    if not safe_mode:
+        config.enable_memory_optim()
+    return config
 
-        if not model_file.exists() or not params_file.exists():
-            raise SystemExit(
-                f"Model files were not found in '{model_dir}'. "
-                "Expected inference.json and inference.pdiparams."
-            )
 
-        self.predictor = self._create_predictor(
+def create_predictor(model_dir: Path, use_gpu: bool = False):
+    inference = load_inference_module()
+    model_file = model_dir / "inference.json"
+    params_file = model_dir / "inference.pdiparams"
+
+    if not model_file.exists() or not params_file.exists():
+        raise SystemExit(
+            f"Model files were not found in '{model_dir}'. "
+            "Expected inference.json and inference.pdiparams."
+        )
+
+    try:
+        fast_config = build_predictor_config(
             inference=inference,
             model_file=model_file,
             params_file=params_file,
             use_gpu=use_gpu,
+            safe_mode=False,
         )
-        self.input_name = self.predictor.get_input_names()[0]
-        self.output_name = self.predictor.get_output_names()[0]
-
-    @staticmethod
-    def _build_config(inference, model_file: Path, params_file: Path, use_gpu: bool, safe_mode: bool):
-        config = inference.Config(str(model_file), str(params_file))
-        if use_gpu:
-            config.enable_use_gpu(1000, 0)
-        else:
-            config.disable_gpu()
-
-        config.switch_ir_optim(not safe_mode)
-        if not safe_mode:
-            config.enable_memory_optim()
-        return config
-
-    def _create_predictor(self, inference, model_file: Path, params_file: Path, use_gpu: bool):
-        try:
-            fast_config = self._build_config(
-                inference=inference,
-                model_file=model_file,
-                params_file=params_file,
-                use_gpu=use_gpu,
-                safe_mode=False,
-            )
-            return inference.create_predictor(fast_config)
-        except Exception as exc:
-            warnings.warn(
-                "Falling back to safe Paddle predictor settings because optimized predictor "
-                f"creation failed: {exc}"
-            )
-
-        safe_config = self._build_config(
+        predictor = inference.create_predictor(fast_config)
+    except Exception as exc:
+        warnings.warn(
+            "Falling back to safe Paddle predictor settings because optimized predictor "
+            f"creation failed: {exc}"
+        )
+        safe_config = build_predictor_config(
             inference=inference,
             model_file=model_file,
             params_file=params_file,
             use_gpu=use_gpu,
             safe_mode=True,
         )
-        return inference.create_predictor(safe_config)
+        predictor = inference.create_predictor(safe_config)
 
-    def predict(self, image: Image.Image) -> Prediction:
-        tensor = self._preprocess(image)
-        input_handle = self.predictor.get_input_handle(self.input_name)
-        input_handle.reshape(tensor.shape)
-        input_handle.copy_from_cpu(tensor)
-        self.predictor.run()
+    return predictor, predictor.get_input_names()[0], predictor.get_output_names()[0]
 
-        output_handle = self.predictor.get_output_handle(self.output_name)
-        logits = np.asarray(output_handle.copy_to_cpu(), dtype=np.float32).reshape(-1)
-        probabilities = self._softmax(logits)
-        class_id = int(np.argmax(probabilities))
 
-        return Prediction(
-            angle=LABELS[class_id],
-            confidence=float(probabilities[class_id]),
-        )
+def preprocess_image_for_model(image: Image.Image) -> np.ndarray:
+    # Keep preprocessing simple: no extra crop generation or deskew logic.
+    resized = image.convert("RGB").resize((224, 224), Image.Resampling.BILINEAR)
+    image_array = np.asarray(resized, dtype=np.float32) / 255.0
+    image_array = (image_array - MEAN) / STD
+    image_array = np.transpose(image_array, (2, 0, 1))
+    image_array = np.expand_dims(image_array, axis=0)
+    return image_array
 
-    def _preprocess(self, image: Image.Image) -> np.ndarray:
-        # Keep preprocessing simple: no extra crop generation or deskew logic.
-        resized = image.convert("RGB").resize((224, 224), Image.Resampling.BILINEAR)
-        image_array = np.asarray(resized, dtype=np.float32) / 255.0
-        image_array = (image_array - MEAN) / STD
-        image_array = np.transpose(image_array, (2, 0, 1))
-        image_array = np.expand_dims(image_array, axis=0)
-        return image_array
 
-    @staticmethod
-    def _softmax(values: np.ndarray) -> np.ndarray:
-        shifted = values - np.max(values)
-        exp_values = np.exp(shifted)
-        return exp_values / np.sum(exp_values)
+def softmax(values: np.ndarray) -> np.ndarray:
+    shifted = values - np.max(values)
+    exp_values = np.exp(shifted)
+    return exp_values / np.sum(exp_values)
+
+
+def predict_orientation(image: Image.Image, predictor, input_name: str, output_name: str) -> tuple[int, float]:
+    tensor = preprocess_image_for_model(image)
+    input_handle = predictor.get_input_handle(input_name)
+    input_handle.reshape(tensor.shape)
+    input_handle.copy_from_cpu(tensor)
+    predictor.run()
+
+    output_handle = predictor.get_output_handle(output_name)
+    logits = np.asarray(output_handle.copy_to_cpu(), dtype=np.float32).reshape(-1)
+    probabilities = softmax(logits)
+    class_id = int(np.argmax(probabilities))
+    return LABELS[class_id], float(probabilities[class_id])
 
 
 def render_page(page: "fitz.Page", dpi: int) -> Image.Image:
@@ -163,7 +148,9 @@ def collect_input_files(input_dir: Path) -> list[Path]:
 def process_pdf(
     input_path: Path,
     output_dir: Path,
-    classifier: OfflineOrientationClassifier,
+    predictor,
+    input_name: str,
+    output_name: str,
     dpi: int,
 ) -> dict:
     import fitz
@@ -175,14 +162,14 @@ def process_pdf(
     try:
         for page_index, page in enumerate(document, start=1):
             page_image = render_page(page, dpi)
-            prediction = classifier.predict(page_image)
-            rotated_page = rotate_image_to_upright(page_image, prediction.angle)
+            angle, confidence = predict_orientation(page_image, predictor, input_name, output_name)
+            rotated_page = rotate_image_to_upright(page_image, angle)
             rotated_pages.append(rotated_page)
             page_results.append(
                 {
                     "page": page_index,
-                    "predicted_angle": prediction.angle,
-                    "confidence": round(prediction.confidence, 6),
+                    "predicted_angle": angle,
+                    "confidence": round(confidence, 6),
                 }
             )
     finally:
@@ -204,11 +191,13 @@ def process_pdf(
 def process_image(
     input_path: Path,
     output_dir: Path,
-    classifier: OfflineOrientationClassifier,
+    predictor,
+    input_name: str,
+    output_name: str,
 ) -> dict:
     with Image.open(input_path) as image:
-        prediction = classifier.predict(image)
-        rotated = rotate_image_to_upright(image, prediction.angle)
+        angle, confidence = predict_orientation(image, predictor, input_name, output_name)
+        rotated = rotate_image_to_upright(image, angle)
         output_path = output_dir / f"{input_path.stem}_rotated{input_path.suffix.lower()}"
         rotated.save(output_path)
 
@@ -216,8 +205,8 @@ def process_image(
         "input_file": input_path.name,
         "output_file": output_path.name,
         "type": "image",
-        "predicted_angle": prediction.angle,
-        "confidence": round(prediction.confidence, 6),
+        "predicted_angle": angle,
+        "confidence": round(confidence, 6),
     }
     save_report(output_dir / f"{input_path.stem}_rotation.json", report)
     return report
@@ -259,15 +248,15 @@ def main() -> int:
         print(f"No supported files found in {input_dir}")
         return 0
 
-    classifier = OfflineOrientationClassifier(model_dir=model_dir, use_gpu=args.use_gpu)
+    predictor, input_name, output_name = create_predictor(model_dir=model_dir, use_gpu=args.use_gpu)
     summary: list[dict] = []
 
     for input_path in files:
         suffix = input_path.suffix.lower()
         if suffix in PDF_EXTENSIONS:
-            result = process_pdf(input_path, output_dir, classifier, dpi=args.dpi)
+            result = process_pdf(input_path, output_dir, predictor, input_name, output_name, dpi=args.dpi)
         elif suffix in IMAGE_EXTENSIONS:
-            result = process_image(input_path, output_dir, classifier)
+            result = process_image(input_path, output_dir, predictor, input_name, output_name)
         else:
             continue
 
